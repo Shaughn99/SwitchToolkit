@@ -174,6 +174,7 @@ class UpgradeApp:
         self.msg_queue = queue.Queue()
         self.rows = {}          # ip -> SwitchRow
         self.busy = False
+        self.inventory_ran = False
         self._workers = 3
         self._scan_workers = 20
         self.cancel_flag = threading.Event()
@@ -509,6 +510,7 @@ class UpgradeApp:
             for widget in row.widgets:
                 widget.destroy()
         self.rows.clear()
+        self.inventory_ran = False
 
         ips = self._parse_ips(report_errors=True)
         if not ips:
@@ -751,12 +753,20 @@ class UpgradeApp:
             return
 
         selected = [ip for ip, row in self.rows.items() if row.selected.get()]
-        kept, _skipped = self._drop_non_responders(selected)
+        if self.inventory_ran:
+            # A scan that found nothing is still a scan: its result is
+            # that there is nothing here, not that it should be ignored.
+            kept, skipped = self._split_inventoried(selected)
+            self._log_skipped(skipped)
+        else:
+            # No scan yet - collection can still run on its own, and its
+            # per-switch probe drops dead addresses quickly.
+            kept = selected
         targets = [(ip, self.rows[ip].state.hostname) for ip in kept]
         if not targets:
             messagebox.showwarning(
                 "Nothing selected",
-                "Select at least one switch that responded.")
+                "Select at least one switch the inventory found.")
             return
 
         if want_tech and not messagebox.askyesno(
@@ -837,16 +847,25 @@ class UpgradeApp:
             messagebox.showwarning("Nothing selected", "Select at least one switch.")
             return
 
-        # An address the inventory could not reach has no chance here, so
-        # it is dropped rather than attempted. Re-run the inventory to
-        # pick up anything that has since come back.
-        targets, skipped = self._drop_non_responders(targets)
+        # Only switches the inventory positively found are queued. A
+        # subnet scan leaves hundreds of empty addresses behind, and
+        # every one of them would otherwise be dialled here.
+        if not self.inventory_ran:
+            messagebox.showwarning(
+                "Run the inventory first",
+                "Prepare only runs against switches the inventory has found.\n\n"
+                "Run Inventory (read-only) first - it takes seconds and confirms "
+                "which addresses actually have a switch behind them.")
+            return
+
+        targets, skipped = self._split_inventoried(targets)
+        self._log_skipped(skipped)
         if not targets:
             messagebox.showinfo(
                 "Nothing to prepare",
-                f"None of the {len(skipped)} selected switch(es) answered the "
-                "inventory.\n\nRe-run the inventory to pick up any that have "
-                "come back.")
+                f"The inventory did not find a switch at any of the "
+                f"{len(skipped)} selected address(es).\n\n"
+                "Re-run the inventory to pick up anything that has come back.")
             return
 
         unverified = [p for p, s in config.family_images.items()
@@ -976,6 +995,8 @@ class UpgradeApp:
                         self._log(f"=== {fields['phase_done'].upper()} PHASE COMPLETE: "
                                   f"{self._status_tally()} ===")
                         self._log_non_responders()
+                        if fields["phase_done"] == "inventory":
+                            self.inventory_ran = True
                     continue
 
                 row = self.rows.get(ip)
@@ -1031,33 +1052,37 @@ class UpgradeApp:
         self.cancel_flag.set()
         self._log("Cancel requested - switches already mid-step will finish that step first.")
 
-    def _drop_non_responders(self, ips):
+    def _split_inventoried(self, ips):
         """
-        Removes addresses the inventory could not reach.
+        Splits addresses into those an inventory actually reached and
+        those it did not.
 
-        A switch that did not answer a read-only inventory will not
-        answer a longer phase either, so attempting it only produces a
-        connection error to read past later. Anything not yet
-        inventoried is left in - only a recorded non-response is
-        grounds for skipping.
+        This is an allowlist on purpose. Listing the addresses to avoid
+        cannot work for a subnet scan: of 254 addresses, ten are
+        switches and the rest are nothing at all, arriving in whatever
+        state the scan left them - never scanned, scan cancelled, or
+        something that accepted a connection but was not a switch. Only
+        a switch the inventory positively found is worth a later phase.
 
-        Returns (kept, skipped).
+        Returns (found, not_found).
         """
-        kept, skipped = [], []
+        found, not_found = [], []
         for ip in ips:
             row = self.rows.get(ip)
-            if row is not None and row.state.status == engine.UNREACHABLE:
-                skipped.append(ip)
+            if row is not None and row.state.inventoried:
+                found.append(ip)
             else:
-                kept.append(ip)
+                not_found.append(ip)
+        return found, not_found
 
-        if skipped:
-            shown = ", ".join(skipped[:12])
-            if len(skipped) > 12:
-                shown += f", ...and {len(skipped) - 12} more"
-            self._log(f"Skipping {len(skipped)} address(es) that did not answer "
-                      f"the inventory: {shown}")
-        return kept, skipped
+    def _log_skipped(self, skipped):
+        if not skipped:
+            return
+        shown = ", ".join(skipped[:12])
+        if len(skipped) > 12:
+            shown += f", ...and {len(skipped) - 12} more"
+        self._log(f"Skipping {len(skipped)} address(es) the inventory did not "
+                  f"find a switch at: {shown}")
 
     def _log_non_responders(self):
         """

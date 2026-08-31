@@ -134,6 +134,11 @@ class SwitchState:
     target_version: str = ""
     image: str = ""
     status: str = PENDING
+    # True once an inventory has actually reached this switch. Kept
+    # separate from status, which a later phase overwrites - a switch
+    # that has been prepared is no longer "Inventoried", but it was
+    # still found.
+    inventoried: bool = False
     progress: int = 0
     message: str = ""
     boot_line: str = ""
@@ -422,12 +427,13 @@ def collect_inventory(ip, config, reporter, cancel_check=None):
             state.mac = first["mac"]
             state.boot_mode = first["boot_mode"]
             state.status = INVENTORIED
+            state.inventoried = True
 
             note = f"{len(members)} stack members" if len(members) > 1 else state.boot_mode
             state.message = note
 
             reporter.update(
-                ip, status=INVENTORIED, progress=100,
+                ip, status=INVENTORIED, progress=100, inventoried=True,
                 model=state.model, serial=state.serial, mac=state.mac,
                 boot_mode=state.boot_mode, current_version=state.current_version,
                 stack_members=members, message=note,

@@ -69,7 +69,8 @@ minutes per switch and produces large files, so it can be unticked. A hostname
 that is already taken gets the IP appended rather than overwriting the earlier
 file.
 
-**Prepare (no reloads)** — per switch:
+**Prepare (no reloads)** — runs only against switches the inventory found. Per
+switch:
 
 1. Identify the model PID and match it to a configured image by prefix.
 2. Skip the switch if it is already on the target version.
@@ -133,10 +134,12 @@ the checker flags.
 - A connection that fails in transit is retried once before the switch is given
   up on. Authentication failures are never retried — repeating a bad password
   risks locking the account.
-- Prepare and file collection skip any address the inventory could not reach,
-  naming them in the log. A switch that has since come back is picked up by
-  re-running the inventory. Addresses that were never inventoried are still
-  attempted — only a recorded non-response is grounds for skipping.
+- Prepare runs only against switches the inventory positively found, and says so
+  if no inventory has been run. Scanning a `/24` to find ten switches leaves 240
+  empty addresses in the list, and none of them are dialled. A switch that has
+  since come back is picked up by re-running the inventory.
+- File collection follows the same rule once an inventory has been run. Without
+  one it still works on its own, relying on the per-switch probe.
 
 ## Accepted IP formats
 
