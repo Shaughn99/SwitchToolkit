@@ -92,23 +92,6 @@ A switch only reaches "Ready to reload" once step 9 passes.
 one at a time or all at once. Each reload waits for the switch to answer ping,
 reconnects, and confirms the running version matches the target.
 
-## Checking captures for a STIG scan
-
-A scanner reporting `Missing configuration section 'show inventory'` is usually
-describing a truncated capture, not a bad scan. To tell which files are affected
-without re-collecting everything:
-
-```bash
-python check_captures.py <folder>/tech-support
-```
-
-It lists each capture with its size and section count, names the missing
-sections, and exits non-zero if any file is incomplete, so it can gate a scan in
-a script. Add `--required "show inventory,show version"` to check a different
-set.
-
-Captures collected before this check existed may be short. Re-collect any file
-the checker flags.
 
 ## Notes
 
