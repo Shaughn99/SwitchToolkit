@@ -130,6 +130,11 @@ the checker flags.
 - Credentials are entered in the UI at run time and are not persisted anywhere.
 - The probe uses TCP/22 rather than ICMP, so a switch that drops ping still
   scans normally. Raise the probe timeout if switches are behind a slow link.
+- A connection that fails in transit is retried once before the switch is given
+  up on. Authentication failures are never retried — repeating a bad password
+  risks locking the account.
+- Prepare will not quietly attempt a switch the inventory could not reach: it
+  asks first, and offers to skip them.
 
 ## Accepted IP formats
 

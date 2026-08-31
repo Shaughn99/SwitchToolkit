@@ -26,7 +26,8 @@ import socket
 import platform
 import subprocess
 from dataclasses import dataclass, field
-from netmiko import ConnectHandler
+from netmiko import (ConnectHandler, NetmikoAuthenticationException,
+                     NetmikoTimeoutException)
 
 
 # ============================================================
@@ -94,6 +95,14 @@ class UpgradeConfig:
     probe_first: bool = True
     probe_port: int = 22
     probe_timeout: float = 1.5
+
+    # --- connect retries ---
+    # A batch run touches each switch once. A connection refused at that
+    # exact moment would otherwise fail the switch for the whole run, so
+    # a transient failure is retried. Authentication failures are never
+    # retried - repeating a bad password risks locking the account.
+    connect_attempts: int = 2
+    connect_retry_delay: int = 5
 
     # --- file collection ---
     output_dir: str = ""
@@ -172,6 +181,47 @@ def tcp_probe(ip, port=22, timeout=1.5):
             return True
     except OSError:
         return False
+
+
+def describe_connect_error(e):
+    """
+    Turns a netmiko connect failure into (status, one-line message).
+
+    netmiko's TCP error is a seven-line block of general advice, which
+    is unreadable in a per-switch status column and buries the one fact
+    that matters: nothing answered on the SSH port.
+    """
+    if isinstance(e, NetmikoAuthenticationException):
+        return FAILED, "Authentication failed - check username and password"
+    if isinstance(e, NetmikoTimeoutException):
+        return UNREACHABLE, "No answer on port 22 - unreachable, or SSH not open"
+    first_line = str(e).strip().splitlines()
+    return FAILED, (first_line[0] if first_line else e.__class__.__name__)
+
+
+def connect(config, ip, reporter=None, timeout=None):
+    """
+    Opens a session, retrying a connection that failed in transit.
+
+    Returns the netmiko connection - use it as a context manager. Raises
+    the last exception when every attempt fails.
+    """
+    delay = config.connect_retry_delay
+    for attempt in range(1, max(config.connect_attempts, 1) + 1):
+        try:
+            return ConnectHandler(**config.device_args(ip, timeout=timeout))
+        except NetmikoAuthenticationException:
+            raise                      # never retry - risks locking the account
+        except (NetmikoTimeoutException, OSError) as e:
+            if attempt >= max(config.connect_attempts, 1):
+                raise
+            if reporter is not None:
+                _status, message = describe_connect_error(e)
+                reporter.log(ip, f"connect attempt {attempt} failed ({message}); "
+                                 f"retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("unreachable")   # pragma: no cover
 
 
 def safe_filename(name, fallback="switch"):
@@ -500,7 +550,7 @@ def collect_files(ip, config, reporter, want_run=True, want_tech=True,
         return result
 
     try:
-        with ConnectHandler(**config.device_args(ip)) as conn:
+        with connect(config, ip, reporter) as conn:
             hostname = hostname_hint or conn.find_prompt().strip("#>")
             hostname = safe_filename(hostname, fallback=ip.replace(".", "-"))
             result["hostname"] = hostname
@@ -778,8 +828,28 @@ def prepare_switch(ip, config, reporter, cancel_check=None):
         return state
 
     try:
+        # Same fast probe the inventory uses. Without it an address that
+        # is simply down surfaces as netmiko's seven-line TCP error
+        # instead of a plain "nothing answered".
+        if config.probe_first:
+            reporter.update(ip, status=PREPARING, progress=1, message="Probing...")
+            if not tcp_probe(ip, config.probe_port, config.probe_timeout):
+                state.status = UNREACHABLE
+                state.message = f"No answer on port {config.probe_port}"
+                reporter.update(ip, status=UNREACHABLE, progress=0, message=state.message)
+                return state
+
         reporter.update(ip, status=PREPARING, progress=2, message="Connecting...")
-        with ConnectHandler(**config.device_args(ip)) as conn:
+        try:
+            session = connect(config, ip, reporter)
+        except Exception as e:
+            status, message = describe_connect_error(e)
+            state.status = status
+            state.message = message
+            reporter.update(ip, status=status, progress=0, message=message)
+            return state
+
+        with session as conn:
             state.hostname = conn.find_prompt().strip("#>")
             reporter.update(ip, hostname=state.hostname, progress=5, message="Connected")
 
@@ -970,7 +1040,7 @@ def reload_switch(state, config, reporter):
     time.sleep(30)
 
     try:
-        with ConnectHandler(**config.device_args(ip)) as conn:
+        with connect(config, ip) as conn:
             new_version = get_current_version(conn) or ""
             state.current_version = new_version
             if state.target_version and state.target_version in new_version:

@@ -494,6 +494,17 @@ class UpgradeApp:
             messagebox.showinfo("Busy", "Wait for the current operation to finish.")
             return
 
+        # Rebuilding replaces every row, discarding what the inventory
+        # found. A later phase then runs with no record of which switches
+        # answered, so this is worth a prompt rather than a surprise.
+        collected = sum(1 for r in self.rows.values() if r.state.stack_members)
+        if collected and not messagebox.askyesno(
+            "Discard inventory results?",
+            f"Rebuilding the list clears the inventory collected from "
+            f"{collected} switch(es).\n\nRebuild anyway?",
+        ):
+            return
+
         for row in self.rows.values():
             for widget in row.widgets:
                 widget.destroy()
@@ -828,6 +839,33 @@ class UpgradeApp:
             messagebox.showwarning("Nothing selected", "Select at least one switch.")
             return
 
+        # An address the inventory could not reach will fail here too.
+        # Prepare is long and unattended, so say so up front rather than
+        # leaving a connection error in the log to be found later.
+        no_answer = [ip for ip in targets
+                     if self.rows[ip].state.status == engine.UNREACHABLE]
+        if no_answer:
+            listed = "\n".join(f"  {ip}" for ip in no_answer[:12])
+            if len(no_answer) > 12:
+                listed += f"\n  ...and {len(no_answer) - 12} more"
+            answer = messagebox.askyesnocancel(
+                "Some switches did not answer",
+                f"{len(no_answer)} of the {len(targets)} selected switch(es) did not "
+                f"answer during the inventory:\n\n{listed}\n\n"
+                "Yes  - skip them and prepare the rest\n"
+                "No   - try them anyway (they may have come back)\n"
+                "Cancel - stop here",
+            )
+            if answer is None:
+                return
+            if answer:
+                targets = [ip for ip in targets if ip not in no_answer]
+                if not targets:
+                    messagebox.showinfo(
+                        "Nothing left",
+                        "Every selected switch was skipped.")
+                    return
+
         unverified = [p for p, s in config.family_images.items()
                       if not s.md5 or s.md5.upper().startswith("PUT_")]
         if unverified:
@@ -954,6 +992,7 @@ class UpgradeApp:
                         self._update_summary()
                         self._log(f"=== {fields['phase_done'].upper()} PHASE COMPLETE: "
                                   f"{self._status_tally()} ===")
+                        self._log_non_responders()
                     continue
 
                 row = self.rows.get(ip)
@@ -1008,6 +1047,23 @@ class UpgradeApp:
     def _cancel(self):
         self.cancel_flag.set()
         self._log("Cancel requested - switches already mid-step will finish that step first.")
+
+    def _log_non_responders(self):
+        """
+        Names the addresses that did not answer.
+
+        Individual non-responses are kept out of the log so a subnet scan
+        stays readable, but they must not be invisible either - one of
+        them is exactly the switch that will fail a later phase.
+        """
+        quiet = [ip for ip, row in self.rows.items()
+                 if row.state.status == engine.UNREACHABLE]
+        if not quiet:
+            return
+        shown = ", ".join(quiet[:12])
+        if len(quiet) > 12:
+            shown += f", ...and {len(quiet) - 12} more"
+        self._log(f"No answer from {len(quiet)} address(es): {shown}")
 
     def _status_tally(self):
         counts = {}
