@@ -92,6 +92,11 @@ A switch only reaches "Ready to reload" once step 9 passes.
 one at a time or all at once. Each reload waits for the switch to answer ping,
 reconnects, and confirms the running version matches the target.
 
+A per-row Reload locks only that row. Reloading takes minutes, so an operator
+working through a stack of switches can start the next one whenever they are
+ready — the other rows stay live and several can be in flight at once. The
+phase-wide buttons stay disabled until they all finish. The batch reload
+buttons still own the window for the length of the run.
 
 ## Notes
 

@@ -173,8 +173,9 @@ class UpgradeApp:
 
         self.msg_queue = queue.Queue()
         self.rows = {}          # ip -> SwitchRow
-        self.busy = False
+        self.busy = False          # a batch phase owns the whole window
         self.inventory_ran = False
+        self._reloading = set()    # switches with their own reload in flight
         self._workers = 3
         self._scan_workers = 20
         self.cancel_flag = threading.Event()
@@ -910,6 +911,18 @@ class UpgradeApp:
     # --------------------------------------------------------
 
     def _reload_single(self, row):
+        """
+        Reloads one switch on its own thread.
+
+        This deliberately does not mark the window busy. Reloading a
+        switch takes many minutes, and an operator working through a
+        stack of them needs to start the next one whenever they are
+        ready rather than waiting for the previous switch to come back.
+        Only the row that was started is locked; every other row stays
+        live.
+        """
+        if self.busy or row.ip in self._reloading:
+            return
         config = self._build_config()
         if not config:
             return
@@ -918,13 +931,26 @@ class UpgradeApp:
             f"Reload {row.ip} ({row.state.hostname})?\n\nThis switch will go down.",
         ):
             return
-        self._set_busy(True)
-        self._log(f"=== RELOAD: {row.ip} ({row.state.hostname}) ===")
-        threading.Thread(target=self._reload_worker,
-                         args=([row.state], config, False), daemon=True).start()
+
+        self._reloading.add(row.ip)
+        self._refresh_controls()
+        self._log(f"=== RELOAD: {row.ip} ({row.state.hostname}) "
+                  f"({len(self._reloading)} reload(s) in flight) ===")
+        threading.Thread(target=self._single_reload_worker,
+                         args=(row.state, config), daemon=True).start()
+
+    def _single_reload_worker(self, state, config):
+        reporter = engine.Reporter(self._post)
+        try:
+            engine.reload_switch(state, config, reporter)
+        except Exception as e:
+            self._post(None, {"log_line": f"Reload error on {state.ip}: {e}"})
+        finally:
+            # Reports only this switch, so the others keep running.
+            self._post(None, {"reload_done": state.ip})
 
     def _start_reloads(self, parallel):
-        if self.busy:
+        if self.busy or self._reloading:
             return
         config = self._build_config()
         if not config:
@@ -988,6 +1014,14 @@ class UpgradeApp:
                 if ip is None:
                     if "log_line" in fields:
                         self._log(fields["log_line"])
+                    if "reload_done" in fields:
+                        # One switch finished. The others keep running, so
+                        # only this row is released.
+                        self._reloading.discard(fields["reload_done"])
+                        self._refresh_controls()
+                        self._update_summary()
+                        if not self._reloading:
+                            self._log("=== ALL SINGLE RELOADS COMPLETE ===")
                     if "phase_done" in fields:
                         self._set_busy(False)
                         self._apply_row_filter()
@@ -1035,18 +1069,34 @@ class UpgradeApp:
 
     def _set_busy(self, busy):
         self.busy = busy
-        state = "disabled" if busy else "normal"
+        self._refresh_controls()
+
+    def _refresh_controls(self):
+        """
+        Sets every button from the current state.
+
+        Two things can be running: a batch phase, which owns the window,
+        and any number of single-switch reloads, which own only their own
+        row. A phase-wide control is disabled while either is happening;
+        a row's Reload button is disabled only while that row is busy.
+        """
+        anything_running = self.busy or bool(self._reloading)
+        state = "disabled" if anything_running else "normal"
         self.btn_inventory.config(state=state)
         self.btn_collect.config(state=state)
         self.btn_prepare.config(state=state)
         self.btn_reload_selected.config(state=state)
         self.btn_reload_all.config(state=state)
-        # export stays available whenever inventory data exists
+
+        # Export reads collected inventory and writes a local file, so
+        # reloads in flight are no reason to withhold it.
         has_data = any(r.state.stack_members for r in self.rows.values())
-        self.btn_export.config(state="normal" if (has_data and not busy) else "disabled")
-        self.btn_cancel.config(state="normal" if busy else "disabled")
-        for row in self.rows.values():
-            row.set_button_enabled(not busy)
+        self.btn_export.config(
+            state="normal" if (has_data and not self.busy) else "disabled")
+        self.btn_cancel.config(state="normal" if anything_running else "disabled")
+
+        for ip, row in self.rows.items():
+            row.set_button_enabled(not self.busy and ip not in self._reloading)
 
     def _cancel(self):
         self.cancel_flag.set()
