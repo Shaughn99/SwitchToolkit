@@ -395,6 +395,55 @@ def collect_inventory(ip, config, reporter, cancel_check=None):
 # FILE COLLECTION (read-only: show running-config / show tech-support)
 # ============================================================
 
+# Sections a STIG scanner expects to find inside a tech-support capture.
+# "show tech-support" normally contains all of these, so a missing one
+# means either the capture was cut short or the platform left it out.
+# Either way the fix is the same: collect it separately and append it.
+TECH_REQUIRED_SECTIONS = ("show version", "show inventory", "show running-config")
+
+# IOS delimits each section as: ------------------ show inventory ------------------
+SECTION_HEADER_RE = re.compile(
+    r"^-{4,}\s*(?P<name>[^\r\n-][^\r\n]*?)\s*-{4,}\s*$", re.MULTILINE)
+
+
+def tech_support_sections(text):
+    """Every section name present in a tech-support capture, lowercased."""
+    return {m.group("name").strip().lower() for m in SECTION_HEADER_RE.finditer(text)}
+
+
+def missing_tech_sections(text, required=TECH_REQUIRED_SECTIONS):
+    """Which of the required sections a capture does not contain."""
+    present = tech_support_sections(text)
+    missing = []
+    for command in required:
+        wanted = command.lower()
+        if not any(name == wanted or name.startswith(wanted + " ") for name in present):
+            missing.append(command)
+    return missing
+
+
+def section_header(command):
+    """The delimiter IOS itself writes, so an appended section parses the same."""
+    return f"------------------ {command} ------------------"
+
+
+def capture_tech_support(conn, config):
+    """
+    Reads "show tech-support" through to the prompt.
+
+    Matching the prompt is what makes this reliable. The command stalls
+    for long stretches while the switch gathers each section, and a read
+    that stops after a fixed quiet period ends the capture inside one of
+    those pauses - silently, because a truncated capture still looks like
+    valid output. Waiting for the prompt is immune to the pauses and
+    returns as soon as the command genuinely finishes.
+    """
+    prompt = conn.find_prompt().strip()
+    pattern = r"(?m)^" + re.escape(prompt) + r"\s*$"
+    return conn.send_command("show tech-support", expect_string=pattern,
+                             read_timeout=config.tech_read_timeout)
+
+
 def _write_output(directory, hostname, ip, text):
     """
     Writes one capture, keeping the <hostname>.txt naming from the
@@ -425,7 +474,7 @@ def collect_files(ip, config, reporter, want_run=True, want_tech=True,
     Returns {"ip", "hostname", "ok", "files", "error"}.
     """
     result = {"ip": ip, "hostname": hostname_hint, "ok": False,
-              "files": [], "error": ""}
+              "files": [], "error": "", "missing_sections": []}
 
     def fail(msg):
         result["error"] = msg
@@ -477,24 +526,39 @@ def collect_files(ip, config, reporter, want_run=True, want_tech=True,
                     result["error"] = "Cancelled"
                     return result
 
-                # show tech-support runs for minutes and produces tens of
-                # MB. send_command_timing reads until the device goes
-                # quiet for last_read seconds rather than trying to match
-                # a prompt inside output that contains prompt-like text.
                 reporter.update(ip, progress=55,
                                 message="Pulling tech-support (several minutes)...")
                 started = time.time()
-                tech = conn.send_command_timing(
-                    "show tech-support",
-                    read_timeout=config.tech_read_timeout,
-                    last_read=5.0,
-                )
+                tech = capture_tech_support(conn, config)
+
+                # A scanner rejects the whole file over one absent
+                # section, so anything missing is collected on its own
+                # and appended under the same delimiter IOS uses.
+                missing = missing_tech_sections(tech)
+                if missing:
+                    reporter.log(ip, "tech-support capture is missing "
+                                     f"{', '.join(missing)} - collecting separately")
+                    reporter.update(ip, progress=80,
+                                    message=f"Adding {len(missing)} missing section(s)...")
+                    for command in missing:
+                        body = conn.send_command(command, read_timeout=300)
+                        tech += f"\n{section_header(command)}\n{body}\n"
+
+                still_missing = missing_tech_sections(tech)
+                result["missing_sections"] = still_missing
+
                 path = _write_output(os.path.join(config.output_dir, "tech-support"),
                                      hostname, ip, tech)
                 result["files"].append(path)
                 elapsed = int(time.time() - started)
                 reporter.log(ip, f"Saved tech-support after {elapsed // 60}m"
-                                 f"{elapsed % 60:02d}s: {path}")
+                                 f"{elapsed % 60:02d}s "
+                                 f"({len(tech):,} bytes, "
+                                 f"{len(tech_support_sections(tech))} sections): {path}")
+                if still_missing:
+                    reporter.log(ip, "WARNING: could not collect "
+                                     f"{', '.join(still_missing)} - a STIG scan of this "
+                                     "file will report the section missing")
 
             result["ok"] = True
             saved = "config + tech-support" if (want_run and want_tech) else (

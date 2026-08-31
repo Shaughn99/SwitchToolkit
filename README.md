@@ -9,6 +9,7 @@ with a Tkinter front end over a headless upgrade engine.
 | --- | --- |
 | `upgrade_engine.py` | All switch logic — connect, inventory, collect, copy, verify, reload. No UI. Reports progress through a callback. |
 | `switch_upgrade_gui.py` | Tkinter front end. Network work runs on worker threads that push messages onto a queue; the UI thread drains it on a timer. |
+| `check_captures.py` | Audits collected tech-support files for the sections a STIG scanner needs. |
 
 The engine never prints and never calls `input()`, so it can be driven from the
 GUI, a CLI, or a test harness without changes.
@@ -54,6 +55,13 @@ the empty addresses off the table once the scan finishes.
 
 where `hostname` is whatever each switch reports as its own.
 
+Tech-support captures are checked for completeness before they are written. A
+scanner rejects a whole file over one absent section, and a capture that was cut
+short still looks like valid output, so anything missing is collected on its own
+and appended under the same `------------------ show x ------------------`
+delimiter IOS uses. If a section still cannot be collected, the log says so
+rather than leaving you to find out from the scanner.
+
 Run it after an inventory and it reuses the hostnames already discovered and
 skips the addresses that did not answer. It also works without one — each
 switch is probed before it is dialled either way. Tech-support takes several
@@ -83,6 +91,24 @@ A switch only reaches "Ready to reload" once step 9 passes.
 one at a time or all at once. Each reload waits for the switch to answer ping,
 reconnects, and confirms the running version matches the target.
 
+## Checking captures for a STIG scan
+
+A scanner reporting `Missing configuration section 'show inventory'` is usually
+describing a truncated capture, not a bad scan. To tell which files are affected
+without re-collecting everything:
+
+```bash
+python check_captures.py <folder>/tech-support
+```
+
+It lists each capture with its size and section count, names the missing
+sections, and exits non-zero if any file is incomplete, so it can gate a scan in
+a script. Add `--required "show inventory,show version"` to check a different
+set.
+
+Captures collected before this check existed may be short. Re-collect any file
+the checker flags.
+
 ## Notes
 
 - **Set the expected MD5.** With it blank, verification is skipped and the tool
@@ -97,6 +123,10 @@ reconnects, and confirms the running version matches the target.
   not use.
 - Copy progress is an elapsed-time estimate — IOS does not report a percentage
   over this channel. The elapsed seconds shown are real.
+- `show tech-support` is read until the device prompt returns, not until the
+  session goes quiet. The command stalls for long stretches while the switch
+  gathers each section, and a quiet-period read ends the capture inside one of
+  those pauses without any error.
 - Credentials are entered in the UI at run time and are not persisted anywhere.
 - The probe uses TCP/22 rather than ICMP, so a switch that drops ping still
   scans normally. Raise the probe timeout if switches are behind a slow link.
