@@ -50,6 +50,40 @@ COLLECTED = "Files saved"
 
 
 # ============================================================
+# UPGRADE METHODS
+# ============================================================
+#
+# BUNDLE  copy the .bin to flash, point "boot system" at it, reload.
+#         Leaves the switch running the bundle directly. This is the
+#         validated path and the default.
+#
+# INSTALL copy the .bin to flash, then "install add" / "install
+#         activate" / "install commit". Keeps a switch in INSTALL mode,
+#         which is what SMU patching and ISSU require.
+#
+# MATCH   use whichever of the two the switch is already running, so a
+#         mixed fleet keeps each switch as it was found.
+
+METHOD_BUNDLE = "bundle"
+METHOD_INSTALL = "install"
+METHOD_MATCH = "match"
+UPGRADE_METHODS = (METHOD_BUNDLE, METHOD_INSTALL, METHOD_MATCH)
+
+
+def resolve_method(method, boot_mode):
+    """
+    The method to actually use on one switch.
+
+    MATCH follows the switch: a switch booted from packages.conf is
+    upgraded through install, anything else through boot system. An
+    unknown mode falls back to bundle, which works either way.
+    """
+    if method != METHOD_MATCH:
+        return method if method in UPGRADE_METHODS else METHOD_BUNDLE
+    return METHOD_INSTALL if (boot_mode or "").upper() == "INSTALL" else METHOD_BUNDLE
+
+
+# ============================================================
 # CONFIG CONTAINERS
 # ============================================================
 
@@ -96,6 +130,15 @@ class UpgradeConfig:
     probe_port: int = 22
     probe_timeout: float = 1.5
 
+    # How the image is put into service. See UPGRADE METHODS above.
+    upgrade_method: str = METHOD_BUNDLE
+
+    # An activated install rolls itself back if it is not committed
+    # within the device's auto-abort window, which is the safety net
+    # for a switch that does not come back. The commit runs once the
+    # switch is up again.
+    install_timeout: int = 2400
+
     # --- connect retries ---
     # A batch run touches each switch once. A connection refused at that
     # exact moment would otherwise fail the switch for the whole run, so
@@ -139,6 +182,10 @@ class SwitchState:
     # that has been prepared is no longer "Inventoried", but it was
     # still found.
     inventoried: bool = False
+    # Which workflow prepare used, so the reload knows how to bring the
+    # image into service.
+    method: str = METHOD_BUNDLE
+    install_state: str = ""
     progress: int = 0
     message: str = ""
     boot_line: str = ""
@@ -764,6 +811,152 @@ def verify_md5(conn, spec):
 
 
 # ============================================================
+# STEP: the install workflow (install add / activate / commit)
+# ============================================================
+
+# Prompts these commands raise: "Do you want to proceed? [y/n]",
+# "System configuration has been modified. Save? [yes/no]",
+# "Proceed with reload? [confirm]".
+INSTALL_PROMPT_RE = re.compile(r"\[y/n\]|\[yes/no\]|\[confirm\]", re.IGNORECASE)
+
+
+def _answer_for(prompt):
+    token = prompt.lower()
+    if "yes/no" in token:
+        return "yes"
+    if "confirm" in token:
+        return ""          # a bare return confirms
+    return "y"
+
+
+def _run_install_command(conn, ip, command, reporter, timeout,
+                         done_markers, fail_markers, progress_note=None):
+    """
+    Runs one long install command, answering its prompts as they appear.
+
+    These commands run for minutes and print continuously, so the
+    channel is read directly rather than waiting for a prompt that will
+    not come back for a long time.
+
+    Each prompt is answered exactly once. The buffer only grows, so
+    testing it for a prompt string would re-answer the same prompt on
+    every pass; instead the prompts seen are counted against the ones
+    already answered.
+
+    Returns (output, ok), ok being None if the command never reported
+    an outcome before the timeout.
+    """
+    reporter.log(ip, command)
+    conn.write_channel(command + "\n")
+    output = ""
+    answered = 0
+    start = time.time()
+
+    while time.time() - start < timeout:
+        time.sleep(5)
+        try:
+            chunk = conn.read_channel()
+        except Exception as e:
+            return output + f"\n[read error: {e}]", False
+        if chunk:
+            output += chunk
+
+        prompts = INSTALL_PROMPT_RE.findall(output)
+        while answered < len(prompts):
+            conn.write_channel(_answer_for(prompts[answered]) + "\n")
+            answered += 1
+
+        if progress_note is not None:
+            elapsed = int(time.time() - start)
+            reporter.update(ip, message=f"{progress_note} "
+                                        f"{elapsed // 60}m{elapsed % 60:02d}s")
+
+        lowered = output.lower()
+        if any(m.lower() in lowered for m in done_markers):
+            return output, True
+        if any(m.lower() in lowered for m in fail_markers):
+            return output, False
+
+    return output, None
+
+
+def parse_install_summary(output):
+    """
+    Versions listed by "show install summary", mapped to their state.
+
+        [ Switch 1 ] Installed Package(s) Information:
+        State (St): I - Inactive, U - Activated & Uncommitted,
+                    C - Committed, D - Deactivated & Uncommitted
+        Type  St   Filename/Version
+        IMG   C    17.09.04a.0.6
+        IMG   I    17.15.05.0.1
+
+    Returns {"17.09.04a.0.6": "C", "17.15.05.0.1": "I"}.
+    """
+    versions = {}
+    for match in re.finditer(
+            r"^\s*IMG\s+([A-Z])\s+(\S+)\s*$", output, re.MULTILINE):
+        versions[match.group(2)] = match.group(1)
+    return versions
+
+
+def install_state_for(summary, target_version):
+    """
+    The install state of the target version, or None if it is absent.
+
+    show install summary reports a build number (17.15.05.0.1) where
+    the configured target is a release (17.15.05), so the match is on
+    the leading release portion.
+    """
+    if not target_version:
+        return None
+    for version, state in summary.items():
+        if version == target_version or version.startswith(target_version + "."):
+            return state
+    return None
+
+
+def install_add(conn, ip, spec, config, reporter):
+    """
+    Stages the image with "install add" - expands it into packages
+    without activating anything. Nothing reloads here.
+
+    Returns (output, ok).
+    """
+    return _run_install_command(
+        conn, ip, f"install add file flash:{spec.image}", reporter,
+        timeout=config.install_timeout,
+        done_markers=("SUCCESS: install_add", "install_add: END"),
+        fail_markers=("FAILED: install_add", "%Error"),
+        progress_note="Expanding image (install add)...",
+    )
+
+
+def verify_install_added(conn, spec):
+    """
+    Confirms the image is staged and ready to activate.
+
+    Returns (ok, state, reason). state is the letter show install
+    summary reports: I inactive (staged), U activated but uncommitted,
+    C committed.
+    """
+    output = conn.send_command("show install summary", read_timeout=120)
+    summary = parse_install_summary(output)
+    if not summary:
+        return False, "", "could not parse show install summary"
+
+    state = install_state_for(summary, spec.target_version)
+    if state is None:
+        return False, "", (f"{spec.target_version} is not listed by show install "
+                           f"summary - the image was not added")
+    if state == "C":
+        return True, state, ""          # already committed: nothing to do
+    if state in ("I", "U"):
+        return True, state, ""
+    return False, state, f"unexpected install state '{state}'"
+
+
+# ============================================================
 # STEP: set and verify boot system
 # ============================================================
 
@@ -874,6 +1067,15 @@ def prepare_switch(ip, config, reporter, cancel_check=None):
                             target_version=spec.target_version,
                             progress=10, message=f"Model {pid}")
 
+            # --- boot mode, so MATCH can follow the switch ---
+            version_out = conn.send_command("show version", read_timeout=60)
+            state.boot_mode = parse_boot_mode(version_out) or ""
+            method = resolve_method(config.upgrade_method, state.boot_mode)
+            state.method = method
+            reporter.update(ip, boot_mode=state.boot_mode, method=method)
+            reporter.log(ip, f"Boot mode {state.boot_mode or 'unknown'} - "
+                             f"upgrading via {method}")
+
             # --- current version ---
             state.current_version = get_current_version(conn) or ""
             reporter.update(ip, current_version=state.current_version,
@@ -973,18 +1175,34 @@ def prepare_switch(ip, config, reporter, cancel_check=None):
             if cancelled():
                 return fail("Cancelled")
 
-            # --- set boot system ---
-            reporter.update(ip, progress=90, message="Setting boot system...")
-            set_boot_system(conn, spec)
+            if method == METHOD_INSTALL:
+                # --- install add (stages packages, nothing reloads) ---
+                reporter.update(ip, progress=88, message="Adding image (install)...")
+                _output, added = install_add(conn, ip, spec, config, reporter)
+                if added is None:
+                    return fail("install add timed out")
+                if added is False:
+                    return fail("install add failed - see the log")
 
-            # --- verify boot system ---
-            ok, boot_value, reason = verify_boot_system(conn, spec)
-            state.boot_line = boot_value
-            reporter.update(ip, boot_line=boot_value)
-            reporter.log(ip, f"BOOT variable: {boot_value}")
+                ok, install_state, reason = verify_install_added(conn, spec)
+                state.install_state = install_state
+                reporter.update(ip, install_state=install_state)
+                reporter.log(ip, f"install summary state: {install_state or 'unknown'}")
+                if not ok:
+                    return fail(f"install verification failed: {reason}")
+            else:
+                # --- set boot system ---
+                reporter.update(ip, progress=90, message="Setting boot system...")
+                set_boot_system(conn, spec)
 
-            if not ok:
-                return fail(f"Boot verification failed: {reason}")
+                # --- verify boot system ---
+                ok, boot_value, reason = verify_boot_system(conn, spec)
+                state.boot_line = boot_value
+                reporter.update(ip, boot_line=boot_value)
+                reporter.log(ip, f"BOOT variable: {boot_value}")
+
+                if not ok:
+                    return fail(f"Boot verification failed: {reason}")
 
             state.status = PREPARED
             state.progress = 100
@@ -1008,20 +1226,43 @@ def reload_switch(state, config, reporter):
     ip = state.ip
     hostname = state.hostname
 
-    reporter.update(ip, status=RELOADING, progress=0, message="Sending reload...")
-    try:
-        with ConnectHandler(**config.device_args(ip)) as conn:
-            conn.write_channel("reload\n")
-            time.sleep(3)
-            out = conn.read_channel()
-            if "[confirm]" in out.lower() or "[yes/no]" in out.lower():
-                conn.write_channel("\n")
-                time.sleep(2)
-                out += conn.read_channel()
-            if "[confirm]" in out.lower():
-                conn.write_channel("\n")
-    except Exception:
-        pass  # the connection dropping is the expected outcome
+    method = getattr(state, "method", METHOD_BUNDLE)
+
+    if method == METHOD_INSTALL:
+        reporter.update(ip, status=RELOADING, progress=0,
+                        message="Activating install...")
+        try:
+            with ConnectHandler(**config.device_args(ip)) as conn:
+                # "install activate" reloads the switch itself. It is
+                # deliberately not committed yet: an activated install
+                # rolls back on its own if the switch never comes back,
+                # which is the safety net for an unattended run. The
+                # commit happens below, once it is up.
+                _out, _ok = _run_install_command(
+                    conn, ip, "install activate", reporter,
+                    timeout=config.install_timeout,
+                    done_markers=("SUCCESS: install_activate",
+                                  "Reload of the system", "Rebooting"),
+                    fail_markers=("FAILED: install_activate",),
+                    progress_note="Activating...",
+                )
+        except Exception:
+            pass  # the connection dropping is the expected outcome
+    else:
+        reporter.update(ip, status=RELOADING, progress=0, message="Sending reload...")
+        try:
+            with ConnectHandler(**config.device_args(ip)) as conn:
+                conn.write_channel("reload\n")
+                time.sleep(3)
+                out = conn.read_channel()
+                if "[confirm]" in out.lower() or "[yes/no]" in out.lower():
+                    conn.write_channel("\n")
+                    time.sleep(2)
+                    out += conn.read_channel()
+                if "[confirm]" in out.lower():
+                    conn.write_channel("\n")
+        except Exception:
+            pass  # the connection dropping is the expected outcome
 
     reporter.update(ip, status=WAITING, message="Waiting for switch to come back...")
     waited = 0
@@ -1047,6 +1288,24 @@ def reload_switch(state, config, reporter):
 
     try:
         with connect(config, ip) as conn:
+            if method == METHOD_INSTALL:
+                # Until this lands the switch will roll itself back when
+                # the auto-abort timer expires, so a failure here is
+                # reported rather than passed over.
+                reporter.update(ip, message="Committing install...")
+                _out, committed = _run_install_command(
+                    conn, ip, "install commit", reporter,
+                    timeout=config.install_timeout,
+                    done_markers=("SUCCESS: install_commit", "install_commit: END"),
+                    fail_markers=("FAILED: install_commit", "%Error"),
+                )
+                if committed:
+                    reporter.log(ip, "install committed")
+                else:
+                    reporter.log(ip, "WARNING: install commit did not report success - "
+                                     "the switch may roll back when its auto-abort "
+                                     "timer expires. Run 'install commit' by hand.")
+
             new_version = get_current_version(conn) or ""
             state.current_version = new_version
             if state.target_version and state.target_version in new_version:

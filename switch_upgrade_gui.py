@@ -38,6 +38,14 @@ DEFAULT_FAMILIES = {
     },
 }
 
+# Shown in the method picker; mapped back to the engine constants.
+METHOD_LABELS = {
+    engine.METHOD_BUNDLE: "Boot system (bundle) - validated",
+    engine.METHOD_INSTALL: "install add / activate / commit",
+    engine.METHOD_MATCH: "Match each switch's current mode",
+}
+METHOD_BY_LABEL = {label: method for method, label in METHOD_LABELS.items()}
+
 STATUS_COLORS = {
     engine.PENDING: "#666666",
     engine.UNREACHABLE: "#999999",
@@ -224,6 +232,19 @@ class UpgradeApp:
         self.var_probe = tk.StringVar(value="1.5")
         ttk.Spinbox(frame, from_=0.5, to=10.0, increment=0.5, format="%.1f",
                     textvariable=self.var_probe, width=5).grid(row=1, column=5, sticky="w", padx=4)
+
+        ttk.Label(frame, text="Upgrade via:").grid(row=2, column=0, sticky="e",
+                                                   padx=4, pady=(0, 6))
+        self.var_method = tk.StringVar(value=METHOD_LABELS[engine.METHOD_BUNDLE])
+        ttk.Combobox(frame, textvariable=self.var_method, width=34, state="readonly",
+                     values=[METHOD_LABELS[m] for m in engine.UPGRADE_METHODS]).grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+        ttk.Label(
+            frame,
+            text="Bundle is the validated path. Install keeps a switch in INSTALL "
+                 "mode (needed for SMU patching / ISSU).",
+            foreground="#666666",
+        ).grid(row=2, column=3, columnspan=5, sticky="w", padx=4, pady=(0, 6))
 
         self.var_hide_unreachable = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame, text="Hide non-responding rows",
@@ -600,7 +621,9 @@ class UpgradeApp:
 
         self._workers = workers
         self._scan_workers = scan_workers
+        method = METHOD_BY_LABEL.get(self.var_method.get(), engine.METHOD_BUNDLE)
         return engine.UpgradeConfig(
+            upgrade_method=method,
             username=self.var_user.get().strip(),
             password=self.var_pass.get(),
             tftp_server=self.var_tftp.get().strip(),
@@ -868,6 +891,18 @@ class UpgradeApp:
                 f"{len(skipped)} selected address(es).\n\n"
                 "Re-run the inventory to pick up anything that has come back.")
             return
+
+        if config.upgrade_method != engine.METHOD_BUNDLE:
+            if not messagebox.askyesno(
+                "Install workflow selected",
+                f"Upgrading via: {self.var_method.get()}\n\n"
+                "This uses install add / activate / commit instead of setting a "
+                "boot system variable. It has not been validated against hardware "
+                "the way the bundle path has.\n\n"
+                "Try it on one switch before running it across a site.\n\n"
+                "Continue?",
+            ):
+                return
 
         unverified = [p for p, s in config.family_images.items()
                       if not s.md5 or s.md5.upper().startswith("PUT_")]

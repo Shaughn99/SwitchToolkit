@@ -69,6 +69,28 @@ minutes per switch and produces large files, so it can be unticked. A hostname
 that is already taken gets the IP appended rather than overwriting the earlier
 file.
 
+### Upgrade method
+
+**Boot system (bundle)** — the default and the validated path. Copies the `.bin`
+to flash, points `boot system` at it, reloads. A switch running in INSTALL mode
+comes back in BUNDLE mode; nothing else about it changes.
+
+**install add / activate / commit** — keeps a switch in INSTALL mode, which is
+what SMU patching and ISSU require. Prepare copies and MD5-verifies the image as
+usual, then runs `install add` to stage it — still no reload. The reload step
+runs `install activate`, which reboots, then `install commit` once the switch is
+back. The commit is deliberately left until after the reboot: an activated
+install rolls itself back if it is never committed, which is the safety net for
+a switch that does not come back up. If the commit fails, the log says so
+explicitly — run `install commit` by hand before the auto-abort timer expires.
+
+**Match each switch's current mode** — install for a switch booted from
+`packages.conf`, boot system for anything else. An unreadable mode falls back to
+bundle.
+
+The install path has not been validated against hardware the way the bundle path
+has, so selecting it asks for confirmation. Try it on one switch first.
+
 **Prepare (no reloads)** — runs only against switches the inventory found. Per
 switch:
 
@@ -106,10 +128,14 @@ buttons still own the window for the length of the run.
 - **A single BOOT entry is enforced.** A leftover second entry lets the switch
   fall through to an old image on reload, which caused a boot loop during
   testing, so it is treated as fatal.
-- **Boot mode is informational.** The `copy` → `boot system` → `verify` →
-  `reload` workflow behaves the same in BUNDLE or INSTALL mode. Mode only
-  matters for the `install add/activate/commit` workflow, which this tool does
-  not use.
+- **Boot mode drives the method only when you ask it to.** The bundle workflow
+  runs the same commands on a switch in either mode, but it leaves an
+  INSTALL-mode switch running in BUNDLE mode afterwards. Pick "Match each
+  switch's current mode" to keep each switch as it was found.
+- **Stacks:** every flash operation targets bare `flash:`, which is the active
+  switch. The image is not copied to other stack members, and the free-space
+  check only reads the active. Verify on one stack before running against a
+  site with stacked switches.
 - Copy progress is an elapsed-time estimate — IOS does not report a percentage
   over this channel. The elapsed seconds shown are real.
 - `show tech-support` is read until the device prompt returns, not until the
