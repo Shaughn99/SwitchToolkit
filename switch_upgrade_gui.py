@@ -750,11 +750,9 @@ class UpgradeApp:
         if not config:
             return
 
-        # Anything the inventory already proved dead is left out. Running
-        # a collection without an inventory first is fine - the per-switch
-        # probe still skips dead addresses quickly.
-        targets = [(ip, row.state.hostname) for ip, row in self.rows.items()
-                   if row.selected.get() and row.state.status != engine.UNREACHABLE]
+        selected = [ip for ip, row in self.rows.items() if row.selected.get()]
+        kept, _skipped = self._drop_non_responders(selected)
+        targets = [(ip, self.rows[ip].state.hostname) for ip in kept]
         if not targets:
             messagebox.showwarning(
                 "Nothing selected",
@@ -839,32 +837,17 @@ class UpgradeApp:
             messagebox.showwarning("Nothing selected", "Select at least one switch.")
             return
 
-        # An address the inventory could not reach will fail here too.
-        # Prepare is long and unattended, so say so up front rather than
-        # leaving a connection error in the log to be found later.
-        no_answer = [ip for ip in targets
-                     if self.rows[ip].state.status == engine.UNREACHABLE]
-        if no_answer:
-            listed = "\n".join(f"  {ip}" for ip in no_answer[:12])
-            if len(no_answer) > 12:
-                listed += f"\n  ...and {len(no_answer) - 12} more"
-            answer = messagebox.askyesnocancel(
-                "Some switches did not answer",
-                f"{len(no_answer)} of the {len(targets)} selected switch(es) did not "
-                f"answer during the inventory:\n\n{listed}\n\n"
-                "Yes  - skip them and prepare the rest\n"
-                "No   - try them anyway (they may have come back)\n"
-                "Cancel - stop here",
-            )
-            if answer is None:
-                return
-            if answer:
-                targets = [ip for ip in targets if ip not in no_answer]
-                if not targets:
-                    messagebox.showinfo(
-                        "Nothing left",
-                        "Every selected switch was skipped.")
-                    return
+        # An address the inventory could not reach has no chance here, so
+        # it is dropped rather than attempted. Re-run the inventory to
+        # pick up anything that has since come back.
+        targets, skipped = self._drop_non_responders(targets)
+        if not targets:
+            messagebox.showinfo(
+                "Nothing to prepare",
+                f"None of the {len(skipped)} selected switch(es) answered the "
+                "inventory.\n\nRe-run the inventory to pick up any that have "
+                "come back.")
+            return
 
         unverified = [p for p, s in config.family_images.items()
                       if not s.md5 or s.md5.upper().startswith("PUT_")]
@@ -1047,6 +1030,34 @@ class UpgradeApp:
     def _cancel(self):
         self.cancel_flag.set()
         self._log("Cancel requested - switches already mid-step will finish that step first.")
+
+    def _drop_non_responders(self, ips):
+        """
+        Removes addresses the inventory could not reach.
+
+        A switch that did not answer a read-only inventory will not
+        answer a longer phase either, so attempting it only produces a
+        connection error to read past later. Anything not yet
+        inventoried is left in - only a recorded non-response is
+        grounds for skipping.
+
+        Returns (kept, skipped).
+        """
+        kept, skipped = [], []
+        for ip in ips:
+            row = self.rows.get(ip)
+            if row is not None and row.state.status == engine.UNREACHABLE:
+                skipped.append(ip)
+            else:
+                kept.append(ip)
+
+        if skipped:
+            shown = ", ".join(skipped[:12])
+            if len(skipped) > 12:
+                shown += f", ...and {len(skipped) - 12} more"
+            self._log(f"Skipping {len(skipped)} address(es) that did not answer "
+                      f"the inventory: {shown}")
+        return kept, skipped
 
     def _log_non_responders(self):
         """

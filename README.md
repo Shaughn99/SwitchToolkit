@@ -133,8 +133,10 @@ the checker flags.
 - A connection that fails in transit is retried once before the switch is given
   up on. Authentication failures are never retried — repeating a bad password
   risks locking the account.
-- Prepare will not quietly attempt a switch the inventory could not reach: it
-  asks first, and offers to skip them.
+- Prepare and file collection skip any address the inventory could not reach,
+  naming them in the log. A switch that has since come back is picked up by
+  re-running the inventory. Addresses that were never inventoried are still
+  attempted — only a recorded non-response is grounds for skipping.
 
 ## Accepted IP formats
 
