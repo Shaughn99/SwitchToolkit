@@ -69,6 +69,22 @@ minutes per switch and produces large files, so it can be unticked. A hostname
 that is already taken gets the IP appended rather than overwriting the earlier
 file.
 
+### Images
+
+The image table starts empty — nothing is prefilled. An image name, hash and
+size left over from someone else's upgrade is worse than a blank box, because it
+looks deliberate; the greyed line above the table shows the format instead.
+
+`+ Add image` adds a row and `−` removes one, so a fleet with one switch family
+lists one image and a mixed fleet lists as many as it needs. A row with neither a
+prefix nor a filename is treated as an unused slot and ignored. A row with only
+one of the two, or a prefix listed twice, is reported rather than silently
+dropped.
+
+Each row needs the model PID prefix (`C9200`, `C9300`), the filename as it sits
+on the TFTP server, the expected MD5, the target version string, and the image
+size in KB.
+
 ### TFTP transfers
 
 Only one switch pulls from TFTP at a time by default. TFTP is UDP with no

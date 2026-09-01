@@ -23,20 +23,15 @@ from concurrent.futures import ThreadPoolExecutor
 import upgrade_engine as engine
 
 
-DEFAULT_FAMILIES = {
-    "C9200": {
-        "image": "9200_cat9k_lite_iosxe.17.15.05.SPA.bin",
-        "md5": "2c45a0c8d3c3957484957f3cdcfa551e",
-        "version": "17.15.05",
-        "size_kb": "492170",
-    },
-    "C9300": {
-        "image": "9300_cat9k_iosxe.17.15.05.SPA.bin",
-        "md5": "",
-        "version": "17.15.05",
-        "size_kb": "1253918",
-    },
-}
+# Shown greyed out above the image table. Nothing here is filled in for
+# you - an image, hash and size left over from someone else's upgrade is
+# worse than an empty box, because it looks deliberate.
+IMAGE_EXAMPLE = ("Example:   C9200   |   9200_cat9k_lite_iosxe.17.18.04.SPA.bin   |   "
+                 "32-character MD5 from the Cisco download page   |   17.18.04   |   "
+                 "size in KB, from dir flash:")
+
+# How many blank rows the image table opens with.
+INITIAL_IMAGE_ROWS = 2
 
 # Shown in the method picker; mapped back to the engine constants.
 METHOD_LABELS = {
@@ -287,36 +282,85 @@ class UpgradeApp:
         img_frame = ttk.LabelFrame(self.root, text="Images (matched by model PID prefix)")
         img_frame.pack(fill="x", padx=8, pady=4)
 
+        self.img_frame = img_frame
+
+        ttk.Label(img_frame, text=IMAGE_EXAMPLE, foreground="#888888").grid(
+            row=0, column=0, columnspan=6, sticky="w", padx=4, pady=(4, 0))
+
         headers = ["Prefix", "Image filename", "Expected MD5", "Target version", "Size (KB)"]
         for col, text in enumerate(headers):
             ttk.Label(img_frame, text=text, font=("TkDefaultFont", 8, "bold")).grid(
-                row=0, column=col, padx=4, sticky="w")
+                row=1, column=col, padx=4, sticky="w")
 
-        self.family_vars = {}
-        for i, (prefix, defaults) in enumerate(DEFAULT_FAMILIES.items(), start=1):
-            v_prefix = tk.StringVar(value=prefix)
-            v_image = tk.StringVar(value=defaults["image"])
-            v_md5 = tk.StringVar(value=defaults["md5"])
-            v_version = tk.StringVar(value=defaults["version"])
-            v_size = tk.StringVar(value=defaults["size_kb"])
-
-            ttk.Entry(img_frame, textvariable=v_prefix, width=10).grid(row=i, column=0, padx=4, pady=2)
-            ttk.Entry(img_frame, textvariable=v_image, width=42).grid(row=i, column=1, padx=4)
-            ttk.Entry(img_frame, textvariable=v_md5, width=34).grid(row=i, column=2, padx=4)
-            ttk.Entry(img_frame, textvariable=v_version, width=12).grid(row=i, column=3, padx=4)
-            ttk.Entry(img_frame, textvariable=v_size, width=12).grid(row=i, column=4, padx=4)
-
-            self.family_vars[prefix] = {
-                "prefix": v_prefix, "image": v_image, "md5": v_md5,
-                "version": v_version, "size_kb": v_size,
-            }
-
-        ttk.Label(
+        # Rows are added and removed at run time, so the widgets below
+        # them are re-gridded rather than pinned to a fixed row.
+        self.image_rows = []
+        self.btn_add_image = ttk.Button(img_frame, text="+  Add image",
+                                        command=self._add_image_row, width=14)
+        self.lbl_md5_note = ttk.Label(
             img_frame,
             text="Leave MD5 blank to skip verification (not recommended - a silent truncated "
-                 "transfer is what causes corrupt installs).",
+                 "transfer is what causes corrupt installs). Size must match the image; it is "
+                 "the fallback check when no MD5 is set.",
             foreground="#aa5500",
-        ).grid(row=len(DEFAULT_FAMILIES) + 1, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 4))
+        )
+        for _ in range(INITIAL_IMAGE_ROWS):
+            self._add_image_row()
+
+    # --------------------------------------------------------
+    # Image rows
+    # --------------------------------------------------------
+
+    def _add_image_row(self):
+        """Appends one blank image row and re-lays out what sits below it."""
+        variables = {name: tk.StringVar() for name in
+                     ("prefix", "image", "md5", "version", "size_kb")}
+
+        widgets = [
+            ttk.Entry(self.img_frame, textvariable=variables["prefix"], width=10),
+            ttk.Entry(self.img_frame, textvariable=variables["image"], width=42),
+            ttk.Entry(self.img_frame, textvariable=variables["md5"], width=34),
+            ttk.Entry(self.img_frame, textvariable=variables["version"], width=12),
+            ttk.Entry(self.img_frame, textvariable=variables["size_kb"], width=12),
+        ]
+        entry = {"vars": variables, "widgets": widgets}
+        remove = ttk.Button(self.img_frame, text="\u2212", width=3,
+                            command=lambda e=entry: self._remove_image_row(e))
+        widgets.append(remove)
+
+        self.image_rows.append(entry)
+        self._regrid_image_rows()
+        return entry
+
+    def _remove_image_row(self, entry):
+        """
+        Drops one image row. The last row is kept so the table cannot
+        disappear - it is cleared instead, which is the same thing an
+        operator means by removing the only row.
+        """
+        if self.busy:
+            return
+        if len(self.image_rows) == 1:
+            for var in entry["vars"].values():
+                var.set("")
+            return
+        for widget in entry["widgets"]:
+            widget.destroy()
+        self.image_rows.remove(entry)
+        self._regrid_image_rows()
+
+    def _regrid_image_rows(self):
+        """Closes the gap a removed row leaves and moves the footer down."""
+        first_row = 2                      # after the example line and headers
+        for index, entry in enumerate(self.image_rows):
+            for col, widget in enumerate(entry["widgets"]):
+                widget.grid(row=first_row + index, column=col, padx=4, pady=2,
+                            sticky="w")
+
+        footer = first_row + len(self.image_rows)
+        self.btn_add_image.grid(row=footer, column=0, padx=4, pady=(4, 2), sticky="w")
+        self.lbl_md5_note.grid(row=footer + 1, column=0, columnspan=6,
+                               sticky="w", padx=4, pady=(2, 4))
 
     def _build_switch_panel(self):
         outer = ttk.LabelFrame(self.root, text="Switches")
@@ -598,20 +642,36 @@ class UpgradeApp:
             return None
 
         families = {}
-        for vars_ in self.family_vars.values():
-            prefix = vars_["prefix"].get().strip()
-            image = vars_["image"].get().strip()
-            if not prefix or not image:
+        for entry in self.image_rows:
+            variables = entry["vars"]
+            prefix = variables["prefix"].get().strip()
+            image = variables["image"].get().strip()
+            # A row with neither a prefix nor an image is an empty slot,
+            # not a mistake - it is simply unused.
+            if not prefix and not image:
                 continue
+            if not prefix or not image:
+                messagebox.showwarning(
+                    "Incomplete image row",
+                    f"{'Image filename' if prefix else 'Prefix'} is missing for "
+                    f"'{prefix or image}'.\n\nFill both in, or clear the row with "
+                    "the \u2212 button.")
+                return None
+            if prefix in families:
+                messagebox.showwarning(
+                    "Duplicate prefix",
+                    f"'{prefix}' is listed more than once. Each prefix matches one "
+                    "image, so remove the row you are not using.")
+                return None
             try:
-                size_kb = int(vars_["size_kb"].get().strip() or "0")
+                size_kb = int(variables["size_kb"].get().strip() or "0")
             except ValueError:
                 messagebox.showwarning("Bad size", f"Size for {prefix} must be a number.")
                 return None
             families[prefix] = engine.ImageSpec(
                 image=image,
-                md5=vars_["md5"].get().strip(),
-                target_version=vars_["version"].get().strip(),
+                md5=variables["md5"].get().strip(),
+                target_version=variables["version"].get().strip(),
                 size_kb=size_kb,
             )
 
