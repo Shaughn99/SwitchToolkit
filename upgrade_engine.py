@@ -23,6 +23,7 @@ import os
 import re
 import time
 import socket
+import threading
 import platform
 import subprocess
 from dataclasses import dataclass, field
@@ -130,6 +131,17 @@ class UpgradeConfig:
     probe_port: int = 22
     probe_timeout: float = 1.5
 
+    # How many switches may pull from TFTP at the same time.
+    #
+    # TFTP is UDP with no congestion control, so simultaneous transfers
+    # of a several-hundred-MB image do not share the link gracefully -
+    # they cause loss, which shows up as retries and aborted sessions on
+    # the server. This is deliberately separate from the worker count:
+    # everything else prepare does (connecting, reading versions,
+    # clearing packages, verifying MD5) still runs in parallel, and only
+    # the transfer itself queues.
+    max_concurrent_transfers: int = 1
+
     # How the image is put into service. See UPGRADE METHODS above.
     upgrade_method: str = METHOD_BUNDLE
 
@@ -150,6 +162,9 @@ class UpgradeConfig:
     # --- file collection ---
     output_dir: str = ""
     tech_read_timeout: int = 1800
+
+    def __post_init__(self):
+        self.transfer_slot = threading.Semaphore(max(1, self.max_concurrent_transfers))
 
     def device_args(self, ip, timeout=None):
         seconds = timeout or self.session_timeout
@@ -1152,8 +1167,19 @@ def prepare_switch(ip, config, reporter, cancel_check=None):
                 if cancelled():
                     return fail("Cancelled")
 
-                # --- copy from TFTP ---
-                output, copy_status = copy_image_to_flash(conn, ip, spec, config, reporter)
+                # --- copy from TFTP, one (or a few) at a time ---
+                slot = config.transfer_slot
+                if not slot.acquire(blocking=False):
+                    reporter.update(ip, progress=30,
+                                    message="Waiting for a transfer slot...")
+                    reporter.log(ip, "Waiting for a TFTP transfer slot")
+                    slot.acquire()
+                try:
+                    output, copy_status = copy_image_to_flash(
+                        conn, ip, spec, config, reporter)
+                finally:
+                    slot.release()
+
                 if copy_status is None:
                     return fail("TFTP copy timed out")
                 if copy_status is False:

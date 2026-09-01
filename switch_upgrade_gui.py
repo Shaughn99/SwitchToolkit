@@ -233,18 +233,31 @@ class UpgradeApp:
         ttk.Spinbox(frame, from_=0.5, to=10.0, increment=0.5, format="%.1f",
                     textvariable=self.var_probe, width=5).grid(row=1, column=5, sticky="w", padx=4)
 
-        ttk.Label(frame, text="Upgrade via:").grid(row=2, column=0, sticky="e",
+        ttk.Label(frame, text="Concurrent TFTP transfers:").grid(
+            row=2, column=0, columnspan=2, sticky="e", padx=4, pady=(0, 6))
+        self.var_transfers = tk.StringVar(value="1")
+        ttk.Spinbox(frame, from_=1, to=10, textvariable=self.var_transfers,
+                    width=5).grid(row=2, column=2, sticky="w", padx=4, pady=(0, 6))
+        ttk.Label(
+            frame,
+            text="TFTP is UDP with no congestion control - simultaneous transfers "
+                 "cause loss and aborted sessions. Only the transfer queues; the "
+                 "rest of prepare still runs in parallel.",
+            foreground="#666666",
+        ).grid(row=2, column=3, columnspan=5, sticky="w", padx=4, pady=(0, 6))
+
+        ttk.Label(frame, text="Upgrade via:").grid(row=3, column=0, sticky="e",
                                                    padx=4, pady=(0, 6))
         self.var_method = tk.StringVar(value=METHOD_LABELS[engine.METHOD_BUNDLE])
         ttk.Combobox(frame, textvariable=self.var_method, width=34, state="readonly",
                      values=[METHOD_LABELS[m] for m in engine.UPGRADE_METHODS]).grid(
-            row=2, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+            row=3, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
         ttk.Label(
             frame,
             text="Bundle is the validated path. Install keeps a switch in INSTALL "
                  "mode (needed for SMU patching / ISSU).",
             foreground="#666666",
-        ).grid(row=2, column=3, columnspan=5, sticky="w", padx=4, pady=(0, 6))
+        ).grid(row=3, column=3, columnspan=5, sticky="w", padx=4, pady=(0, 6))
 
         self.var_hide_unreachable = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame, text="Hide non-responding rows",
@@ -621,9 +634,14 @@ class UpgradeApp:
 
         self._workers = workers
         self._scan_workers = scan_workers
+        try:
+            transfers = max(1, int(self.var_transfers.get()))
+        except ValueError:
+            transfers = 1
         method = METHOD_BY_LABEL.get(self.var_method.get(), engine.METHOD_BUNDLE)
         return engine.UpgradeConfig(
             upgrade_method=method,
+            max_concurrent_transfers=transfers,
             username=self.var_user.get().strip(),
             password=self.var_pass.get(),
             tftp_server=self.var_tftp.get().strip(),

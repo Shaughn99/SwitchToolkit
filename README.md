@@ -69,6 +69,21 @@ minutes per switch and produces large files, so it can be unticked. A hostname
 that is already taken gets the IP appended rather than overwriting the earlier
 file.
 
+### TFTP transfers
+
+Only one switch pulls from TFTP at a time by default. TFTP is UDP with no
+congestion control, so simultaneous transfers of a several-hundred-MB image do
+not share a link gracefully — they cause loss, which shows up on the server as
+retried read requests and aborted sessions. The limit is separate from the
+worker count: connecting, reading versions, clearing packages and verifying MD5
+still run in parallel, and only the transfer queues.
+
+If the server logs `Peer returns ERROR <Session terminated>` right after an
+`OACK`, the switch is rejecting the server's option negotiation — check the
+server's block-size setting before looking at anything else. A forced
+`blksize=8192` also needs IP fragmentation on a standard 1500-byte MTU, and
+those fragments are easy to lose.
+
 ### Upgrade method
 
 **Boot system (bundle)** — the default and the validated path. Copies the `.bin`
